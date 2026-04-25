@@ -7,6 +7,7 @@ Music Cutter — Especialista em Fim de Música com IA
 import threading
 import os
 import queue
+import traceback
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -130,15 +131,20 @@ class MusicCutterApp(ctk.CTk):
         threading.Thread(target=self._worker, args=(files, sobra), daemon=True).start()
 
     def _worker(self, files, sobra):
-        self._log_queue.put("Carregando motor de IA...")
-        from ai_processor import process_audio_ai
+        try:
+            self._log_queue.put("Carregando motor de IA...")
+            from ai_processor import process_audio_ai
 
-        for idx, f in enumerate(files, 1):
-            self._log_queue.put(f"[{idx}/{len(files)}] {f.name}")
-            dest = self._dest_dir / f.name
-            ok = process_audio_ai(f, dest, sobra_ms=sobra, log_callback=lambda m: self._log_queue.put(m))
-        self._log_queue.put("\n✅ TODOS OS ARQUIVOS PROCESSADOS!")
-        self._log_queue.put("DONE")
+            for idx, f in enumerate(files, 1):
+                self._log_queue.put(f"[{idx}/{len(files)}] {f.name}")
+                dest = self._dest_dir / f.name
+                process_audio_ai(f, dest, sobra_ms=sobra, log_callback=lambda m: self._log_queue.put(m))
+            self._log_queue.put("\n✅ TODOS OS ARQUIVOS PROCESSADOS!")
+        except Exception as e:
+            self._log_queue.put(f"\n❌ Erro ao carregar/processar com IA: {e}")
+            self._log_queue.put(traceback.format_exc())
+        finally:
+            self._log_queue.put("DONE")
 
     def _poll_log_queue(self):
         try:

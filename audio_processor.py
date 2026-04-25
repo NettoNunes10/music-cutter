@@ -12,14 +12,9 @@ import tempfile
 from pathlib import Path
 
 
-def _patch_subprocess_no_console():
-    """Evita janelas de terminal ao chamar FFmpeg/FFprobe no Windows."""
-    if os.name != "nt" or getattr(subprocess.Popen, "_music_cutter_no_console", False):
-        return
-
-    original_popen = subprocess.Popen
-
-    def quiet_popen(*args, **kwargs):
+def _quiet_popen(*args, **kwargs):
+    """Cria subprocessos escondidos no Windows, mantendo subprocess.Popen intacto."""
+    if os.name == "nt":
         kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
         startupinfo = kwargs.get("startupinfo")
         if startupinfo is None:
@@ -27,13 +22,30 @@ def _patch_subprocess_no_console():
             kwargs["startupinfo"] = startupinfo
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
-        return original_popen(*args, **kwargs)
-
-    quiet_popen._music_cutter_no_console = True
-    subprocess.Popen = quiet_popen
+    return subprocess.Popen(*args, **kwargs)
 
 
-_patch_subprocess_no_console()
+class _HiddenSubprocessProxy:
+    def __getattr__(self, name):
+        return getattr(subprocess, name)
+
+    def Popen(self, *args, **kwargs):
+        return _quiet_popen(*args, **kwargs)
+
+
+def _patch_pydub_subprocess_no_console():
+    """Evita janelas do FFmpeg/FFprobe sem alterar o subprocess global."""
+    if os.name != "nt":
+        return
+
+    try:
+        import pydub.audio_segment
+        import pydub.utils
+    except ImportError:
+        return
+
+    pydub.audio_segment.subprocess = _HiddenSubprocessProxy()
+    pydub.utils.Popen = _quiet_popen
 
 # ── Detecta e configura o FFmpeg no PATH antes do pydub ──────────────────────────
 def _setup_ffmpeg_path():
@@ -77,6 +89,7 @@ try:
     if _FFMPEG_BIN:
         pydub.AudioSegment.converter = os.path.join(_FFMPEG_BIN, "ffmpeg.exe")
         pydub.AudioSegment.ffprobe = os.path.join(_FFMPEG_BIN, "ffprobe.exe")
+    _patch_pydub_subprocess_no_console()
 except ImportError:
     pass
 
