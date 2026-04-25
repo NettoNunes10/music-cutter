@@ -1,0 +1,6 @@
+customtkinter>=5.2.0
+pydub>=0.25.1
+tensorflow>=2.15.0
+tensorflow-hub>=0.16.1
+numpy
+resampy
