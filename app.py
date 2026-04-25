@@ -12,7 +12,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
-from ai_processor import process_audio_ai, SUPPORTED_FORMATS
+SUPPORTED_FORMATS = {".mp3", ".wav", ".flac", ".m4a"}
 
 # Configurações visuais
 ctk.set_appearance_mode("dark")
@@ -130,6 +130,9 @@ class MusicCutterApp(ctk.CTk):
         threading.Thread(target=self._worker, args=(files, sobra), daemon=True).start()
 
     def _worker(self, files, sobra):
+        self._log_queue.put("Carregando motor de IA...")
+        from ai_processor import process_audio_ai
+
         for idx, f in enumerate(files, 1):
             self._log_queue.put(f"[{idx}/{len(files)}] {f.name}")
             dest = self._dest_dir / f.name

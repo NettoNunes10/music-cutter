@@ -1,14 +1,16 @@
 import os
-import numpy as np
-import tensorflow as tf
-import tensorflow_hub as hub
-from pydub import AudioSegment
-from pathlib import Path
-from pydub.utils import mediainfo
-from audio_processor import export_with_original_metadata
 
-# Silenciar logs do TensorFlow
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+# Silenciar logs do TensorFlow antes de importar o runtime.
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+import numpy as np
+from pathlib import Path
+from audio_processor import export_with_original_metadata
+from pydub import AudioSegment
+from pydub.utils import mediainfo
+
+tf = None
+hub = None
 
 # Configurações globais
 YAMNET_MODEL_URL = 'https://tfhub.dev/google/yamnet/1'
@@ -25,8 +27,13 @@ ID_CROWD = 64
 
 def load_yamnet():
     """Carrega o modelo YAMNet de forma global."""
-    global YAMNET_MODEL
+    global YAMNET_MODEL, tf, hub
     if YAMNET_MODEL is None:
+        if hub is None:
+            import tensorflow as _tf
+            import tensorflow_hub as _hub
+            tf = _tf
+            hub = _hub
         YAMNET_MODEL = hub.load(YAMNET_MODEL_URL)
     return YAMNET_MODEL
 

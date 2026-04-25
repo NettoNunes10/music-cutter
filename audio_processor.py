@@ -11,6 +11,30 @@ import sys
 import tempfile
 from pathlib import Path
 
+
+def _patch_subprocess_no_console():
+    """Evita janelas de terminal ao chamar FFmpeg/FFprobe no Windows."""
+    if os.name != "nt" or getattr(subprocess.Popen, "_music_cutter_no_console", False):
+        return
+
+    original_popen = subprocess.Popen
+
+    def quiet_popen(*args, **kwargs):
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
+        startupinfo = kwargs.get("startupinfo")
+        if startupinfo is None:
+            startupinfo = subprocess.STARTUPINFO()
+            kwargs["startupinfo"] = startupinfo
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        return original_popen(*args, **kwargs)
+
+    quiet_popen._music_cutter_no_console = True
+    subprocess.Popen = quiet_popen
+
+
+_patch_subprocess_no_console()
+
 # ── Detecta e configura o FFmpeg no PATH antes do pydub ──────────────────────────
 def _setup_ffmpeg_path():
     """Busca o FFmpeg e adiciona ao PATH do processo para o pydub encontrar."""
