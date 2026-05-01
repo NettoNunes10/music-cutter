@@ -18,6 +18,17 @@ hub = None
 YAMNET_MODEL_URL = 'https://tfhub.dev/google/yamnet/1'
 YAMNET_MODEL = None
 TFHUB_BAD_MODEL_MSG = "contains neither 'saved_model.pb' nor 'saved_model.pbtxt'"
+FRAME_STEP_MS = 480
+SILENCE_DBFS = -45.0
+SILENCE_MIN_FRAMES = 4
+TRANSITION_FRAMES = 3
+LOW_MUSIC_FRAMES = 6
+LOW_MUSIC_THRESHOLD = 0.18
+MUSIC_RECOVERY_THRESHOLD = 0.35
+MUSIC_RECOVERY_FRAMES = 3
+RECENT_MUSIC_THRESHOLD = 0.28
+RECENT_MUSIC_LOOKBACK = 10
+SMOOTHING_FRAMES = 3
 
 # Índices Oficiais do YAMNet (Confirmados via mapeamento AudioSet)
 ID_SPEECH = 0
@@ -89,10 +100,43 @@ def get_yamnet_predictions(audio_segment: AudioSegment, log_callback=None):
     scores, _, _ = model(samples)
     return scores.numpy()
 
+
+def _moving_average(values: np.ndarray, window_size: int) -> np.ndarray:
+    if window_size <= 1 or len(values) == 0:
+        return values
+    kernel = np.ones(window_size) / window_size
+    return np.convolve(values, kernel, mode="same")
+
+
+def _chunk_dbfs(chunk: AudioSegment) -> float:
+    value = chunk.dBFS
+    if value == float("-inf"):
+        return -100.0
+    return value
+
+
+def _window_is_below(values: np.ndarray, start: int, count: int, threshold: float) -> bool:
+    end = start + count
+    return end <= len(values) and bool(np.all(values[start:end] < threshold))
+
+
+def _has_later_music_recovery(values: np.ndarray, start: int) -> bool:
+    last_start = len(values) - MUSIC_RECOVERY_FRAMES
+    for j in range(max(0, start), last_start + 1):
+        if np.all(values[j:j + MUSIC_RECOVERY_FRAMES] >= MUSIC_RECOVERY_THRESHOLD):
+            return True
+    return False
+
+
+def _had_recent_music(values: np.ndarray, index: int) -> bool:
+    start = max(0, index - RECENT_MUSIC_LOOKBACK)
+    window = values[start:index + 1]
+    return len(window) > 0 and bool(np.max(window) >= RECENT_MUSIC_THRESHOLD)
+
 def identify_cue_out_ms(audio: AudioSegment, log_callback=None) -> tuple[int, str]:
     """
     Engine de Decisão Baseado em Regras de Engenharia de Áudio.
-    Implementa Rolling Windows e Thresholds Rígidos.
+    Implementa janelas sustentadas, suavização e confirmação contra retomada musical.
     """
     def log(m):
         if log_callback: log_callback(m)
@@ -105,42 +149,59 @@ def identify_cue_out_ms(audio: AudioSegment, log_callback=None) -> tuple[int, st
     
     scores = get_yamnet_predictions(tail, log_callback=log)
     num_frames = scores.shape[0]
-    frame_step_ms = 480 # Passo de 480ms entre frames (YAMNet hop)
     
     # Agrupamento de Classes Positivas (Música e derivados vocais)
     # Somamos Music + Singing + A Cappella para evitar falsos cortes em pontes vocais
-    music_score = scores[:, ID_MUSIC] + scores[:, ID_SINGING] + scores[:, ID_A_CAPPELLA]
-    speech_score = scores[:, ID_SPEECH]
-    crowd_score = scores[:, ID_APPLAUSE] + scores[:, ID_CHEERING] + scores[:, ID_CROWD]
+    music_raw = scores[:, ID_MUSIC] + scores[:, ID_SINGING] + scores[:, ID_A_CAPPELLA]
+    speech_raw = scores[:, ID_SPEECH]
+    crowd_raw = scores[:, ID_APPLAUSE] + scores[:, ID_CHEERING] + scores[:, ID_CROWD]
+    music_score = _moving_average(music_raw, SMOOTHING_FRAMES)
+    speech_score = _moving_average(speech_raw, SMOOTHING_FRAMES)
+    crowd_score = _moving_average(crowd_raw, SMOOTHING_FRAMES)
+    rms_dbfs = np.array([
+        _chunk_dbfs(tail[i * FRAME_STEP_MS : (i + 1) * FRAME_STEP_MS])
+        for i in range(num_frames)
+    ])
     
     log(f"--- Iniciando análise de {num_frames} frames ---")
 
     for i in range(num_frames):
-        current_ms = start_offset + (i * frame_step_ms)
+        current_ms = start_offset + (i * FRAME_STEP_MS)
         
         # --- REGRA C: Fim Seco / Silêncio (Físico) ---
-        chunk = tail[i * frame_step_ms : (i + 1) * frame_step_ms]
-        if len(chunk) > 0 and chunk.dBFS < -45:
-            log(f"  [!] Regra C: Silêncio físico em {current_ms/1000:.2f}s (RMS: {chunk.dBFS:.1f} dBFS)")
+        if (
+            _window_is_below(rms_dbfs, i, SILENCE_MIN_FRAMES, SILENCE_DBFS)
+            and not _has_later_music_recovery(music_score, i + SILENCE_MIN_FRAMES)
+        ):
+            silence_ms = SILENCE_MIN_FRAMES * FRAME_STEP_MS
+            avg_rms = np.mean(rms_dbfs[i:i + SILENCE_MIN_FRAMES])
+            log(f"  [!] Regra C: Silêncio sustentado em {current_ms/1000:.2f}s "
+                f"({silence_ms}ms, RMS médio: {avg_rms:.1f} dBFS, sem retomada musical)")
             return current_ms, "Regra_C"
 
-        # --- REGRA A: Transição para Voz/Plateia (Rolling Window 3 frames) ---
-        if i <= num_frames - 3:
-            # Verifica se a condição se mantém em i, i+1 e i+2
-            window_indices = range(i, i + 3)
+        # --- REGRA A: Transição para Voz/Plateia ---
+        if i <= num_frames - TRANSITION_FRAMES:
             is_rule_a = all(
                 music_score[j] < 0.20 and (speech_score[j] > 0.60 or crowd_score[j] > 0.50)
-                for j in range(i, i + 3)
+                for j in range(i, i + TRANSITION_FRAMES)
             )
-            if is_rule_a:
-                log(f"  [!] Regra A: Transição validada em {current_ms/1000:.2f}s (Buffer: 3 frames)")
+            if is_rule_a and not _has_later_music_recovery(music_score, i + TRANSITION_FRAMES):
+                log(f"  [!] Regra A: Transição validada em {current_ms/1000:.2f}s "
+                    f"({TRANSITION_FRAMES} frames, sem retomada musical)")
                 return current_ms, "Regra_A"
 
-        # --- REGRA B: Fade-out Longo / Baixa Energia Musical (Rolling Window 4 frames) ---
-        if i <= num_frames - 4:
-            is_rule_b = all(music_score[j] < 0.15 for j in range(i, i + 4))
-            if is_rule_b:
-                log(f"  [!] Regra B: Fade-out detectado em {current_ms/1000:.2f}s (Buffer: 4 frames)")
+        # --- REGRA B: Fade-out Longo / Baixa Energia Musical ---
+        if i <= num_frames - LOW_MUSIC_FRAMES:
+            is_rule_b = _window_is_below(music_score, i, LOW_MUSIC_FRAMES, LOW_MUSIC_THRESHOLD)
+            if (
+                is_rule_b
+                and _had_recent_music(music_score, i)
+                and not _has_later_music_recovery(music_score, i + LOW_MUSIC_FRAMES)
+            ):
+                window_ms = LOW_MUSIC_FRAMES * FRAME_STEP_MS
+                avg_music = np.mean(music_score[i:i + LOW_MUSIC_FRAMES])
+                log(f"  [!] Regra B: Fade-out detectado em {current_ms/1000:.2f}s "
+                    f"({window_ms}ms, score musical médio: {avg_music:.2f}, sem retomada musical)")
                 return current_ms, "Regra_B"
 
     # Fallback: Fim original do arquivo
@@ -172,7 +233,9 @@ def process_audio_ai(source_path: Path, dest_path: Path, sobra_ms: int = 3000, l
         # Se a faixa original for mais curta que a sobra necessária, completa com silêncio
         if len(audio_tail) < sobra_ms:
             padding_ms = sobra_ms - len(audio_tail)
-            audio_tail += AudioSegment.silent(duration=padding_ms, frame_rate=audio.frame_rate)
+            padding = AudioSegment.silent(duration=padding_ms, frame_rate=audio.frame_rate)
+            padding = padding.set_channels(audio.channels).set_sample_width(audio.sample_width)
+            audio_tail += padding
             
         # Aplica o fade out exato na margem adicional
         audio_tail_faded = audio_tail.fade_out(duration=sobra_ms)

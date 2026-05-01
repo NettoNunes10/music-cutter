@@ -6,6 +6,7 @@ Music Cutter — Especialista em Fim de Música com IA
 
 import threading
 import os
+import json
 import queue
 import traceback
 from pathlib import Path
@@ -14,6 +15,9 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 SUPPORTED_FORMATS = {".mp3", ".wav", ".flac", ".m4a"}
+APP_NAME = "Music Cutter IA"
+DEFAULT_SOBRA_MS = 3000
+MAX_SOBRA_MS = 60000
 
 # Configurações visuais
 ctk.set_appearance_mode("dark")
@@ -59,9 +63,38 @@ class MusicCutterApp(ctk.CTk):
         self._dest_dir: Path | None = None
         self._processing = False
         self._log_queue: queue.Queue = queue.Queue()
+        self._settings = self._load_settings()
 
         self._build_ui()
         self._poll_log_queue()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _settings_path(self) -> Path:
+        if os.name == "nt":
+            base = Path(os.environ.get("APPDATA", Path.home()))
+        else:
+            base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        return base / APP_NAME / "settings.json"
+
+    def _load_settings(self) -> dict:
+        path = self._settings_path()
+        try:
+            if path.exists():
+                with path.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+        return {}
+
+    def _save_settings(self) -> None:
+        path = self._settings_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as f:
+                json.dump(self._settings, f, indent=2)
+        except Exception:
+            pass
 
     def _build_ui(self):
         outer = ctk.CTkFrame(self, fg_color="transparent")
@@ -104,7 +137,8 @@ class MusicCutterApp(ctk.CTk):
         frame = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"], corner_radius=12, border_width=1, border_color=COLORS["border"])
         frame.grid(row=3, column=0, sticky="ew", pady=(0, 5), padx=2)
         
-        self._entry_sobra = LabeledEntry(frame, label="Sobra/Mixagem (ms)", default_value="3000")
+        sobra_default = str(self._settings.get("sobra_ms", DEFAULT_SOBRA_MS))
+        self._entry_sobra = LabeledEntry(frame, label="Sobra/Mixagem (ms)", default_value=sobra_default)
         self._entry_sobra.pack(side="left", padx=20, pady=20, fill="x", expand=True)
         
         ctk.CTkLabel(frame, text="A IA cortará exatamente no fim da música.\nA sobra será aplicada como fade ou silêncio conforme detectado.", text_color=COLORS["text_muted"], font=ctk.CTkFont(size=11), justify="left").pack(side="right", padx=20)
@@ -116,18 +150,56 @@ class MusicCutterApp(ctk.CTk):
         p = filedialog.askdirectory()
         if p: self._dest_dir = Path(p); self._lbl_dest.configure(text=str(p), text_color=COLORS["text_primary"])
 
+    def _read_sobra_ms(self, show_error: bool = True) -> int | None:
+        raw_value = self._entry_sobra.get().strip()
+        try:
+            sobra = int(raw_value)
+        except ValueError:
+            if show_error:
+                messagebox.showerror("Erro", "Informe a sobra/mixagem em milissegundos usando apenas números.")
+            return None
+
+        if sobra < 0 or sobra > MAX_SOBRA_MS:
+            if show_error:
+                messagebox.showerror("Erro", f"A sobra/mixagem precisa ficar entre 0 e {MAX_SOBRA_MS} ms.")
+            return None
+        return sobra
+
+    def _persist_sobra_ms(self, sobra_ms: int) -> None:
+        self._settings["sobra_ms"] = sobra_ms
+        self._save_settings()
+
+    def _same_path(self, left: Path, right: Path) -> bool:
+        try:
+            return left.resolve() == right.resolve()
+        except Exception:
+            return os.path.abspath(left) == os.path.abspath(right)
+
+    def _on_close(self):
+        sobra = self._read_sobra_ms(show_error=False)
+        if sobra is not None:
+            self._persist_sobra_ms(sobra)
+        self.destroy()
+
     def _on_start(self):
         if not self._source_dir or not self._dest_dir:
             messagebox.showerror("Erro", "Selecione as pastas de origem e destino."); return
+
+        if self._same_path(self._source_dir, self._dest_dir):
+            messagebox.showerror("Erro", "A pasta de destino precisa ser diferente da pasta de origem para não sobrescrever os arquivos originais.")
+            return
         
         files = [f for f in self._source_dir.iterdir() if f.is_file() and f.suffix.lower() in SUPPORTED_FORMATS]
         if not files: messagebox.showwarning("Aviso", "Nenhum arquivo de áudio encontrado."); return
 
+        sobra = self._read_sobra_ms()
+        if sobra is None:
+            return
+        self._persist_sobra_ms(sobra)
+
         self._processing = True
         self._btn_process.configure(state="disabled", text="⏳ PROCESSANDO COM IA...")
         self._clear_log()
-        
-        sobra = int(self._entry_sobra.get())
         threading.Thread(target=self._worker, args=(files, sobra), daemon=True).start()
 
     def _worker(self, files, sobra):
@@ -140,6 +212,10 @@ class MusicCutterApp(ctk.CTk):
             for idx, f in enumerate(files, 1):
                 self._log_queue.put(f"[{idx}/{len(files)}] {f.name}")
                 dest = self._dest_dir / f.name
+                if self._same_path(f, dest):
+                    self._log_queue.put("  ⚠ Ignorado: destino igual ao arquivo original.")
+                    fail_count += 1
+                    continue
                 if process_audio_ai(f, dest, sobra_ms=sobra, log_callback=lambda m: self._log_queue.put(m)):
                     success_count += 1
                 else:
