@@ -135,11 +135,20 @@ class MusicCutterApp(ctk.CTk):
             self._log_queue.put("Carregando motor de IA...")
             from ai_processor import process_audio_ai
 
+            success_count = 0
+            fail_count = 0
             for idx, f in enumerate(files, 1):
                 self._log_queue.put(f"[{idx}/{len(files)}] {f.name}")
                 dest = self._dest_dir / f.name
-                process_audio_ai(f, dest, sobra_ms=sobra, log_callback=lambda m: self._log_queue.put(m))
-            self._log_queue.put("\n✅ TODOS OS ARQUIVOS PROCESSADOS!")
+                if process_audio_ai(f, dest, sobra_ms=sobra, log_callback=lambda m: self._log_queue.put(m)):
+                    success_count += 1
+                else:
+                    fail_count += 1
+
+            if fail_count:
+                self._log_queue.put(f"\n⚠ Processamento concluído com falhas: {success_count} sucesso(s), {fail_count} falha(s).")
+            else:
+                self._log_queue.put("\n✅ TODOS OS ARQUIVOS PROCESSADOS!")
         except Exception as e:
             self._log_queue.put(f"\n❌ Erro ao carregar/processar com IA: {e}")
             self._log_queue.put(traceback.format_exc())

@@ -1,4 +1,6 @@
 import os
+import re
+import shutil
 
 # Silenciar logs do TensorFlow antes de importar o runtime.
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -15,6 +17,7 @@ hub = None
 # Configurações globais
 YAMNET_MODEL_URL = 'https://tfhub.dev/google/yamnet/1'
 YAMNET_MODEL = None
+TFHUB_BAD_MODEL_MSG = "contains neither 'saved_model.pb' nor 'saved_model.pbtxt'"
 
 # Índices Oficiais do YAMNet (Confirmados via mapeamento AudioSet)
 ID_SPEECH = 0
@@ -25,7 +28,33 @@ ID_APPLAUSE = 62
 ID_CHEERING = 61
 ID_CROWD = 64
 
-def load_yamnet():
+def _find_bad_tfhub_cache_path(error: Exception) -> Path | None:
+    match = re.search(r"'([^']*tfhub_modules[^']*)'", str(error))
+    if not match:
+        return None
+    cache_path = Path(match.group(1))
+    return cache_path if cache_path.exists() else None
+
+
+def _remove_bad_tfhub_cache(error: Exception, log_callback=None) -> bool:
+    cache_path = _find_bad_tfhub_cache_path(error)
+    if not cache_path:
+        return False
+
+    def log(m):
+        if log_callback:
+            log_callback(m)
+
+    try:
+        shutil.rmtree(cache_path)
+        log(f"  ↳ Cache corrompido do YAMNet removido: {cache_path}")
+        return True
+    except Exception as cleanup_error:
+        log(f"  ⚠ Não consegui remover o cache corrompido do YAMNet: {cleanup_error}")
+        return False
+
+
+def load_yamnet(log_callback=None):
     """Carrega o modelo YAMNet de forma global."""
     global YAMNET_MODEL, tf, hub
     if YAMNET_MODEL is None:
@@ -34,10 +63,17 @@ def load_yamnet():
             import tensorflow_hub as _hub
             tf = _tf
             hub = _hub
-        YAMNET_MODEL = hub.load(YAMNET_MODEL_URL)
+        try:
+            YAMNET_MODEL = hub.load(YAMNET_MODEL_URL)
+        except ValueError as e:
+            if TFHUB_BAD_MODEL_MSG not in str(e) or not _remove_bad_tfhub_cache(e, log_callback):
+                raise
+            if log_callback:
+                log_callback("  ↳ Baixando o modelo YAMNet novamente...")
+            YAMNET_MODEL = hub.load(YAMNET_MODEL_URL)
     return YAMNET_MODEL
 
-def get_yamnet_predictions(audio_segment: AudioSegment):
+def get_yamnet_predictions(audio_segment: AudioSegment, log_callback=None):
     """Resample para 16kHz mono e extrai probabilidades do YAMNet."""
     # Requisito YAMNet: 16kHz Mono
     audio = audio_segment.set_frame_rate(16000).set_channels(1)
@@ -49,7 +85,7 @@ def get_yamnet_predictions(audio_segment: AudioSegment):
     elif audio.sample_width == 4:
         samples /= 2147483648.0
         
-    model = load_yamnet()
+    model = load_yamnet(log_callback=log_callback)
     scores, _, _ = model(samples)
     return scores.numpy()
 
@@ -67,7 +103,7 @@ def identify_cue_out_ms(audio: AudioSegment, log_callback=None) -> tuple[int, st
     start_offset = duration_ms - analysis_duration_ms
     tail = audio[start_offset:]
     
-    scores = get_yamnet_predictions(tail)
+    scores = get_yamnet_predictions(tail, log_callback=log)
     num_frames = scores.shape[0]
     frame_step_ms = 480 # Passo de 480ms entre frames (YAMNet hop)
     
